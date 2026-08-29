@@ -1,3 +1,7 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+# Go build artifacts / local test binaries
+whatsapp-bridge/whatsapp-bridge.baseline
+whatsapp-bridge/whatsapp-bridge.candidate
+whatsapp-bridge/backups/
