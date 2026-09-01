@@ -164,7 +164,7 @@ func TestStoreAndGetMediaInfo_DirectPathRoundTrip(t *testing.T) {
 	key := []byte("k")
 	err := s.StoreMessage("M1", "c@s.whatsapp.net", "c", "", time.Now(), false,
 		"audio", "a.ogg", "https://legacy/url.enc", "/v/t62.real/path.enc",
-		key, []byte("sha"), []byte("enc"), 1234)
+		key, []byte("sha"), []byte("enc"), 1234, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestStoreAndGetMediaInfo_DirectPathRoundTrip(t *testing.T) {
 	// Row with NO direct_path (legacy) -> GetMediaInfo returns "" for it, no scan error.
 	err = s.StoreMessage("M2", "c@s.whatsapp.net", "c", "", time.Now(), false,
 		"image", "i.jpg", "https://legacy/only-url.enc", "",
-		key, []byte("sha"), []byte("enc"), 55)
+		key, []byte("sha"), []byte("enc"), 55, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,5 +189,77 @@ func TestStoreAndGetMediaInfo_DirectPathRoundTrip(t *testing.T) {
 	}
 	if dp2 != "" || url2 != "https://legacy/only-url.enc" {
 		t.Fatalf("legacy row: dp=%q url=%q", dp2, url2)
+	}
+}
+
+// ── from_history_sync flag (BRIDGE3_FIRST_REPAIR_INCIDENT_2026-09-02) ────────
+
+func TestMigration_FreshStoreHasHistoryFlag(t *testing.T) {
+	s := withStore(t)
+	defer s.Close()
+	if !hasCol(t, s.db, "from_history_sync") {
+		t.Fatal("fresh store: messages.from_history_sync missing")
+	}
+	// default must be 0 for a live-path insert
+	if err := s.StoreChat("c@s.whatsapp.net", "C", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StoreMessage("L1", "c@s.whatsapp.net", "c", "hi", time.Now(), false,
+		"", "", "", "", nil, nil, nil, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	var flag int
+	if err := s.db.QueryRow("SELECT from_history_sync FROM messages WHERE id='L1'").Scan(&flag); err != nil {
+		t.Fatal(err)
+	}
+	if flag != 0 {
+		t.Fatalf("live message from_history_sync = %d, want 0", flag)
+	}
+}
+
+func TestStoreMessage_HistorySyncFlagAndNoClobber(t *testing.T) {
+	s := withStore(t)
+	defer s.Close()
+	if err := s.StoreChat("c@s.whatsapp.net", "C", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Now()
+
+	// history-sync insert -> flag 1
+	if err := s.StoreMessage("H1", "c@s.whatsapp.net", "c", "old history text", ts, false,
+		"", "", "", "", nil, nil, nil, 0, true); err != nil {
+		t.Fatal(err)
+	}
+	var flag int
+	var content string
+	if err := s.db.QueryRow("SELECT from_history_sync, content FROM messages WHERE id='H1'").Scan(&flag, &content); err != nil {
+		t.Fatal(err)
+	}
+	if flag != 1 || content != "old history text" {
+		t.Fatalf("history row: flag=%d content=%q", flag, content)
+	}
+
+	// a LIVE message arrives, same id/chat -> REPLACE, becomes flag 0
+	if err := s.StoreMessage("H1", "c@s.whatsapp.net", "c", "live version", ts, false,
+		"", "", "", "", nil, nil, nil, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT from_history_sync, content FROM messages WHERE id='H1'").Scan(&flag, &content); err != nil {
+		t.Fatal(err)
+	}
+	if flag != 0 || content != "live version" {
+		t.Fatalf("after live replace: flag=%d content=%q, want flag=0 content=\"live version\"", flag, content)
+	}
+
+	// history sync re-delivers the same id -> must NOT clobber the live row back to flag 1
+	if err := s.StoreMessage("H1", "c@s.whatsapp.net", "c", "history again", ts, false,
+		"", "", "", "", nil, nil, nil, 0, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT from_history_sync, content FROM messages WHERE id='H1'").Scan(&flag, &content); err != nil {
+		t.Fatal(err)
+	}
+	if flag != 0 || content != "live version" {
+		t.Fatalf("history re-delivery clobbered live row: flag=%d content=%q", flag, content)
 	}
 }

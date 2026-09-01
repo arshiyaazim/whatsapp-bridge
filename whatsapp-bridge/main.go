@@ -114,6 +114,28 @@ func NewMessageStore() (*MessageStore, error) {
 		fmt.Println("[migration] added messages.direct_path column")
 	}
 
+	// Additive migration (2026-09-02): `from_history_sync` marks rows written
+	// by handleHistorySync() (WhatsApp server-side backfill on a fresh device
+	// link) as opposed to live events.Message deliveries. The fazle-core
+	// bridge poller uses this to keep historical/imported messages out of
+	// live business routing (BRIDGE3_FIRST_REPAIR_INCIDENT_2026-09-02: a
+	// re-pair history-sync replayed ~2,444 old messages and one was
+	// auto-answered). Idempotent; default 0; never rewrites existing rows.
+	var hasHistFlag int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'from_history_sync'",
+	).Scan(&hasHistFlag); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to check messages schema: %v", err)
+	}
+	if hasHistFlag == 0 {
+		if _, err := db.Exec("ALTER TABLE messages ADD COLUMN from_history_sync INTEGER NOT NULL DEFAULT 0"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to add from_history_sync column: %v", err)
+		}
+		fmt.Println("[migration] added messages.from_history_sync column")
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -131,18 +153,36 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
-// Store a message in the database
+// Store a message in the database.
+//
+// fromHistorySync distinguishes rows written by handleHistorySync() (WhatsApp
+// server backfill on a fresh device link) from live events.Message deliveries.
+// Live messages use INSERT OR REPLACE (unchanged). History-sync rows use
+// INSERT ... ON CONFLICT DO NOTHING so a backfill can never overwrite — or
+// re-flag as historical — a row that already arrived live.
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url, directPath string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url, directPath string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	fromHistorySync bool) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
+	if fromHistorySync {
+		_, err := store.db.Exec(
+			`INSERT INTO messages
+			(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, direct_path, from_history_sync)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+			ON CONFLICT(id, chat_jid) DO NOTHING`,
+			id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, directPath,
+		)
+		return err
+	}
+
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, direct_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, direct_path, from_history_sync)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, directPath,
 	)
 	return err
@@ -477,6 +517,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		false, // live delivery, not history sync
 	)
 
 	if err != nil {
@@ -1292,6 +1333,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					true, // history sync backfill — poller keeps these out of live routing
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
