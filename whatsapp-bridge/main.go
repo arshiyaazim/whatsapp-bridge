@@ -984,6 +984,50 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
+	// Install signal handling FIRST, before any pairing/connect work begins.
+	//
+	// 2026-09-05 pairing-lifecycle fix: previously this was registered only
+	// at the very end of main(), right before the final "wait forever"
+	// block. Until Go's signal.Notify is called for a given signal, the
+	// runtime's DEFAULT disposition for SIGINT/SIGTERM is to terminate the
+	// process immediately, with no chance for any in-flight goroutine to
+	// finish -- including whatsmeow's own internal, detached goroutine that
+	// persists a freshly-paired device (go.mau.fi/whatsmeow's
+	// handlePairSuccess -> cli.Store.Save(ctx), run via `go func(){...}()`,
+	// independent of and racing against handleHistorySync's message writes).
+	//
+	// Root-caused live incident (2026-09-05): a foreground bridge3 pairing
+	// attempt reached "History sync complete" (proving the phone-side link
+	// and message stream were genuinely live) and was then Ctrl-C'd -- but
+	// because signal.Notify had not yet been called at that point in the old
+	// code, the SIGINT killed the process outright via Go's default
+	// behavior, before cli.Store.Save(ctx) had (or could have) committed the
+	// device row. messages.db gained real history; whatsapp.db's
+	// whatsmeow_device table stayed at zero rows and its mtime never moved.
+	// The phone believed it had linked a device; the local store never did.
+	//
+	// Calling signal.Notify here, before container/device/QR/connect setup,
+	// disables that default kill-on-signal behavior for the rest of the
+	// process's life: from this point on, SIGINT/SIGTERM are only ever
+	// observed by explicitly reading exitChan, which happens at the single,
+	// well-defined orderly-shutdown point at the end of main() (see below).
+	// A signal that arrives during pairing is deliberately not acted on
+	// immediately -- there is no safe way to abort a pairing handshake or an
+	// in-flight Store.Save() mid-flight without risking exactly this
+	// incident's partial state, so pairing is left to resolve on its own
+	// (success, its own 3-minute QR timeout, or an error return) and the
+	// signal is handled the moment we reach a point where shutting down is
+	// always safe. This is the smallest change that removes the race: no
+	// storage format, REST API, or message-handling change is involved.
+	exitChan := make(chan os.Signal, 1)
+	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
+	shutdownRequested := make(chan struct{})
+	go func() {
+		<-exitChan
+		logger.Warnf("Shutdown requested (SIGINT/SIGTERM). Deferring to the next safe point -- not interrupting an in-flight pairing/save operation.")
+		close(shutdownRequested)
+	}()
+
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
@@ -1114,14 +1158,13 @@ func main() {
 	}
 	startRESTServer(client, messageStore, restPort)
 
-	// Create a channel to keep the main goroutine alive
-	exitChan := make(chan os.Signal, 1)
-	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
-
 	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
 
-	// Wait for termination signal
-	<-exitChan
+	// Wait for the termination signal armed at the top of main(). By this
+	// point pairing (if any) has already fully resolved -- device state, if
+	// any was created, is already durably saved -- so acting on the signal
+	// here is always an orderly shutdown, never a mid-pairing interruption.
+	<-shutdownRequested
 
 	fmt.Println("Disconnecting...")
 	// Disconnect client
